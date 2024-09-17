@@ -1,178 +1,77 @@
-//! Records a WAV file (roughly 3 seconds long) using the default input device and config.
-//!
-//! The input data is recorded to "$CARGO_MANIFEST_DIR/recorded.wav".
-
-use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample};
-use mel_spec::prelude::*;
-use std::fs::File;
-use std::io::BufWriter;
-use std::sync::{Arc, Mutex};
-
-#[derive(Parser, Debug)]
-#[command(version, about = "CPAL record_wav example", long_about = None)]
-struct Opt {
-    /// The audio device to use
-    #[arg(short, long, default_value_t = String::from("default"))]
-    device: String,
-
-    /// Use the JACK host
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        ),
-        feature = "jack"
-    ))]
-    #[arg(short, long)]
-    #[allow(dead_code)]
-    jack: bool,
+use burn_ndarray::NdArray;
+use mel_spec::{prelude::*, vad::duration_ms_for_n_frames};
+use mel_spec_pipeline::prelude::*;
+use std::thread;
+mod alexa {
+    include!(concat!(env!("OUT_DIR"), "/test_models/alexa_v0.rs"));
 }
 
-fn main() -> Result<(), anyhow::Error> {
-    let opt = Opt::parse();
-    let CHUNK_SIZE = 1280;
-    // Conditionally compile with jack if the feature is specified.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        ),
-        feature = "jack"
-    ))]
-    // Manually check for flags. Can be passed through cargo with -- e.g.
-    // cargo run --release --example beep --features jack -- --jack
-    let host = if opt.jack {
-        cpal::host_from_id(cpal::available_hosts()
-            .into_iter()
-            .find(|id| *id == cpal::HostId::Jack)
-            .expect(
-                "make sure --features jack is specified. only works on OSes where jack is available",
-            )).expect("jack host unavailable")
-    } else {
-        cpal::default_host()
-    };
+fn main() {
+    let sample_rate = 16000.0;
+    let fft_size = 512;
+    let n_mels = 80;
+    let hop_size = 160;
+    let bit_depth = 32;
+    let min_y = 3;
+    let min_x = 5;
+    let mel_settings = MelConfig::new(fft_size, hop_size, n_mels, sample_rate as f64);
+    let vad_settings = DetectionSettings::new(1.0, min_y, min_x, 0);
+    let audio_config = AudioConfig::new(bit_depth, sample_rate);
+    let pipeline_config = PipelineConfig::new(audio_config, mel_settings, vad_settings);
 
-    #[cfg(any(
-        not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        )),
-        not(feature = "jack")
-    ))]
-    let host = cpal::default_host();
+    let pipeline = Pipeline::new(pipeline_config);
+    let mel_rx = pipeline.mel_rx();
 
-    // Set up the input device and stream with the default input config.
-    let device = if opt.device == "default" {
-        host.default_input_device()
-    } else {
-        host.input_devices()?
-            .find(|x| x.name().map(|y| y == opt.device).unwrap_or(false))
-    }
-    .expect("failed to find input device");
+    #[cfg(debug_assertions)]
+    let mel_path = "debug_out";
 
-    println!("Input device: {}", device.name()?);
+    let n_mels = 80;
 
-    let config = device
-        .default_input_config()
-        .expect("Failed to get default input config");
-    println!("Default input config: {:?}", config);
+    let model: alexa::Model<NdArray<f64>> = alexa::Model::default();
+    let handle = thread::spawn(move || {
+        //let ctx = WhisperContext::new(&model_path).expect("failed to load model");
+        //let mut state = ctx.create_state().expect("failed to create key");
 
-    // The WAV file we're recording to.
-    const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/recorded.wav");
-    let spec = wav_spec_from_config(&config);
-    let writer = hound::WavWriter::create(PATH, spec)?;
-    let writer = Arc::new(Mutex::new(Some(writer)));
+        let mut buf = PipelineOutputBuffer::new();
+        while let Ok(mel) = mel_rx.recv() {
+            if let Some(frames) = buf.add(mel.idx(), mel.frame()) {
+                #[cfg(debug_assertions)]
+                {
+                    let debug_image_path = format!("{}/frame_{}.tga", mel_path, mel.idx());
+                    let _ = save_tga_8bit(&frames, n_mels, &debug_image_path);
+                }
+                let current_mel_spec = duration_ms_for_n_frames(hop_size, sample_rate, mel.idx());
+                // let ms = duration_ms_for_n_frames(hop_size, sampling_rate, mel.idx());
+                // let time = format_milliseconds(ms as u64);
 
-    // A flag to indicate that recording is in progress.
-    println!("Begin recording...");
+                // let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+                // params.set_n_threads(6);
+                // params.set_single_segment(true);
+                // params.set_language(Some("en"));
+                // params.set_print_special(false);
+                // params.set_print_progress(false);
+                // params.set_print_realtime(false);
+                // params.set_print_timestamps(false);
+                // state.set_mel(&frames).unwrap();
 
-    // Run the input stream on a separate thread.
-    let writer_2 = writer.clone();
+                model.forward(input1)
 
-    let err_fn = move |err| {
-        eprintln!("an error occurred on stream: {}", err);
-    };
-    println!("{:?}", config);
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::I8 => device.build_input_stream(
-            &config.into(),
-            move |data, _: &_| write_input_data::<i8, i8>(data, &writer_2),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
-            move |data, _: &_| write_input_data::<i16, i16>(data, &writer_2),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::I32 => device.build_input_stream(
-            &config.into(),
-            move |data, _: &_| write_input_data::<i32, i32>(data, &writer_2),
-            err_fn,
-            None,
-        )?,
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
-            move |data, _: &_| write_input_data::<f32, f32>(data, &writer_2),
-            err_fn,
-            None,
-        )?,
-        sample_format => {
-            return Err(anyhow::Error::msg(format!(
-                "Unsupported sample format '{sample_format}'"
-            )))
-        }
-    };
+                let empty = vec![];
+                //state.full(params, &empty[..]).unwrap();
 
-    stream.play()?;
-
-    // Let recording go for roughly three seconds.
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    drop(stream);
-    writer.lock().unwrap().take().unwrap().finalize()?;
-    println!("Recording {} complete!", PATH);
-    Ok(())
-}
-
-fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
-    if format.is_float() {
-        hound::SampleFormat::Float
-    } else {
-        hound::SampleFormat::Int
-    }
-}
-
-fn wav_spec_from_config(config: &cpal::SupportedStreamConfig) -> hound::WavSpec {
-    hound::WavSpec {
-        channels: config.channels() as _,
-        sample_rate: config.sample_rate().0 as _,
-        bits_per_sample: (config.sample_format().sample_size() * 8) as _,
-        sample_format: sample_format(config.sample_format()),
-    }
-}
-
-type WavWriterHandle = Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>;
-
-fn write_input_data<T, U>(input: &[T], writer: &WavWriterHandle)
-where
-    T: Sample,
-    U: Sample + hound::Sample + FromSample<T>,
-{
-    if let Ok(mut guard) = writer.try_lock() {
-        if let Some(writer) = guard.as_mut() {
-            for &sample in input.iter() {
-                let sample: U = U::from_sample(sample);
-                writer.write_sample(sample).ok();
+                //let num_segments = state.full_n_segments().unwrap();
+                if num_segments > 0 {
+                    if let Ok(text) = state.full_get_segment_text(0) {
+                        let msg = format!("{} [{}] {}", mel.idx(), time, text);
+                        println!("{}", msg);
+                    } else {
+                        println!("Error retrieving text for segment.");
+                    }
+                }
             }
         }
-    }
+    });
+    print!("Hello, world!")
 }
+
+fn default_pipeline() -> Pipeline {}
