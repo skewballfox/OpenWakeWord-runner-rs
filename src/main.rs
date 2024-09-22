@@ -1,77 +1,112 @@
-use burn_ndarray::NdArray;
-use mel_spec::{prelude::*, vad::duration_ms_for_n_frames};
-use mel_spec_pipeline::prelude::*;
-use std::thread;
+use burn::tensor::{Tensor, TensorPrimitive};
+use burn_ndarray::{NdArray, NdArrayDevice, NdArrayTensor};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use mel_spec::{prelude::*, rb::RingBuffer as MelFrameBuffer};
+
+use ndarray::{Array2, Axis};
+use ringbuf::{
+    traits::{Consumer, Observer, Producer, Split},
+    HeapRb,
+};
+use soundkit::{audio_bytes::deinterleave_vecs_f32, wav::WavStreamProcessor};
+
+use std::{
+    process::exit,
+    thread::{self, panicking},
+};
 mod alexa {
     include!(concat!(env!("OUT_DIR"), "/test_models/alexa_v0.rs"));
 }
 
 fn main() {
-    let sample_rate = 16000.0;
+    let mel_path = "./mel_out";
+    let n_mels = 80;
     let fft_size = 512;
-    let n_mels = 80;
     let hop_size = 160;
-    let bit_depth = 32;
-    let min_y = 3;
-    let min_x = 5;
-    let mel_settings = MelConfig::new(fft_size, hop_size, n_mels, sample_rate as f64);
-    let vad_settings = DetectionSettings::new(1.0, min_y, min_x, 0);
-    let audio_config = AudioConfig::new(bit_depth, sample_rate);
-    let pipeline_config = PipelineConfig::new(audio_config, mel_settings, vad_settings);
-
-    let pipeline = Pipeline::new(pipeline_config);
-    let mel_rx = pipeline.mel_rx();
-
-    #[cfg(debug_assertions)]
-    let mel_path = "debug_out";
-
     let n_mels = 80;
+    let sampling_rate = 16000.0;
 
-    let model: alexa::Model<NdArray<f64>> = alexa::Model::default();
-    let handle = thread::spawn(move || {
-        //let ctx = WhisperContext::new(&model_path).expect("failed to load model");
-        //let mut state = ctx.create_state().expect("failed to create key");
+    let mel_config = MelConfig::new(fft_size, hop_size, n_mels, sampling_rate);
 
-        let mut buf = PipelineOutputBuffer::new();
-        while let Ok(mel) = mel_rx.recv() {
-            if let Some(frames) = buf.add(mel.idx(), mel.frame()) {
-                #[cfg(debug_assertions)]
-                {
-                    let debug_image_path = format!("{}/frame_{}.tga", mel_path, mel.idx());
-                    let _ = save_tga_8bit(&frames, n_mels, &debug_image_path);
-                }
-                let current_mel_spec = duration_ms_for_n_frames(hop_size, sample_rate, mel.idx());
-                // let ms = duration_ms_for_n_frames(hop_size, sampling_rate, mel.idx());
-                // let time = format_milliseconds(ms as u64);
+    let mut frame_buffer = MelFrameBuffer::new(mel_config, 1024);
 
-                // let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-                // params.set_n_threads(6);
-                // params.set_single_segment(true);
-                // params.set_language(Some("en"));
-                // params.set_print_special(false);
-                // params.set_print_progress(false);
-                // params.set_print_realtime(false);
-                // params.set_print_timestamps(false);
-                // state.set_mel(&frames).unwrap();
+    let mut processor = WavStreamProcessor::new();
 
-                model.forward(input1)
+    let (stream, mut consumer) = create_input_stream::<f64>(sampling_rate as u32, 128);
 
-                let empty = vec![];
-                //state.full(params, &empty[..]).unwrap();
+    let mut frames: Vec<Array2<f64>> = Vec::new();
 
-                //let num_segments = state.full_n_segments().unwrap();
-                if num_segments > 0 {
-                    if let Ok(text) = state.full_get_segment_text(0) {
-                        let msg = format!("{} [{}] {}", mel.idx(), time, text);
-                        println!("{}", msg);
-                    } else {
-                        println!("Error retrieving text for segment.");
-                    }
-                }
-            }
+    let wakeword: alexa::Model<NdArray<f64>> = alexa::Model::new(&NdArrayDevice::Cpu);
+
+    let mut buffer = [0u8; 128];
+    stream.play().unwrap();
+    loop {
+        if consumer.occupied_len() < buffer.len() {
+            continue;
         }
-    });
-    print!("Hello, world!")
+        let _ = consumer.pop_slice(&mut buffer);
+        let samples = deinterleave_vecs_f32(&buffer, 2);
+        frame_buffer.add_frame(&samples[0]);
+        if let Some(mel_frame) = frame_buffer.maybe_mel() {
+            let ndtensor: NdArrayTensor<f64, 3> = NdArrayTensor::<f64, 3>::new(
+                mel_frame.insert_axis(Axis(0)).into_dyn().into_shared(),
+            );
+            let float_primitive = TensorPrimitive::Float(ndtensor);
+            let burn_tensor = Tensor::from_primitive(float_primitive);
+
+            let res = wakeword.forward(burn_tensor);
+            println!("{:?}", res);
+        }
+    }
+    //println!("Using output device: \"{}\"", output_device.name()?);
 }
 
-fn default_pipeline() -> Pipeline {}
+fn create_input_stream<T>(
+    sample_rate: u32,
+    buffer_size: u32,
+) -> (
+    cpal::Stream,
+    ringbuf::wrap::caching::Caching<
+        std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<u8>>>,
+        false,
+        true,
+    >,
+)
+where
+    T: cpal::SizedSample,
+{
+    let host = cpal::default_host();
+    let input_device = host
+        .default_input_device()
+        .expect("no input device available");
+    let device_config = cpal::StreamConfig {
+        channels: 2,
+        sample_rate: cpal::SampleRate(sample_rate),
+        //todo: change later
+        buffer_size: cpal::BufferSize::Fixed(buffer_size * 2),
+    };
+    println!("Using input device: \"{}\"", input_device.name().unwrap());
+
+    let ring = HeapRb::<u8>::new(buffer_size as usize * 2);
+
+    let (mut producer, mut consumer) = ring.split();
+
+    let input_fn = move |data: &[u8], _: &cpal::InputCallbackInfo| {
+        for &sample in data {
+            if producer.try_push(sample).is_err() {
+                println!("Error pushing to ring buffer");
+            }
+        }
+    };
+
+    let stream = input_device
+        .build_input_stream(&device_config, input_fn, err_fn, None)
+        .unwrap();
+
+    (stream, consumer)
+}
+
+fn err_fn(err: cpal::StreamError) {
+    eprintln!("an error occurred on stream: {}", err);
+}

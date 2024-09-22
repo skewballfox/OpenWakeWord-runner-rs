@@ -6,17 +6,20 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-mel_spec = { git = "https://github.com/wavey-ai/mel-spec" }
-mel_spec_pipeline = { git = "https://github.com/wavey-ai/mel-spec" }
-ndarray = "0.15.6"
+mel_spec = { git = "https://github.com/skewballfox/mel-spec", branch = "nd_update" }
+ndarray = "^0.16"
 #anyhow = "1.0.75"
 burn = { git = "https://github.com/tracel-ai/burn.git" }
 burn-ndarray = { git = "https://github.com/tracel-ai/burn.git" }
-
+cpal = "0.15.3"
+ringbuf = "0.4.1"
+soundkit = "0.10.5"
 
 [dev-dependencies]
 clap = { version = "4.4.6", features = ["derive"] }
-#cpal = "0.15.2"
+
+#ashpd = { version = "0.9.1", features = ["pipewire"] }
+
 #hound = "3.5.1"
 
 [build-dependencies]

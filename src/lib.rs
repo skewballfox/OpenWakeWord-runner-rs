@@ -1,6 +1,5 @@
 use mel_spec::prelude::*;
 use mel_spec::vad::{duration_ms_for_n_frames, format_milliseconds};
-use mel_spec_pipeline::prelude::*;
 
 // struct WakewordDetector<Mel> {
 //     // /// Preprocessor for audio data. Converts audio data to mel spectrogram, Optionally applies VAD.
